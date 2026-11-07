@@ -41,17 +41,6 @@ const translate = (seq: string): string | null => {
   return null
 }
 
-// Ground truth for alacritty (and other legacy terminals): the wire carries
-// ESC + full UTF-8 Cyrillic char (e.g. 1b d0 b4 for alt+д), but the native
-// stdin parser mangles it BEFORE any input handler sees it: it emits two
-// events, ESC+(cp & 0xFF) and ESC+U+FFFD, so the letter cannot be recovered
-// from the event. The renderer copies every raw stdin chunk to stdinLogPath
-// BEFORE parsing, so that file is the authoritative wire. This plugin reads
-// it with a cursor: each ESC-prefixed event consumes exactly one wire
-// ESC-sequence; if that sequence is ESC + UTF-8 Cyrillic, the Latin
-// equivalent is injected. Real alt+ASCII needs no guessing and no delays.
-const WIRE_LOG = "/tmp/opencode-stdin.log"
-
 export default Plugin.define({
   id: "ru-keys",
   setup(context) {
@@ -64,7 +53,6 @@ export default Plugin.define({
       _internalKeyInput?: {
         processParsedKey: (key: Record<string, unknown>) => boolean
       }
-      stdinLogPath?: string
     }
 
     let replaying = false
@@ -112,106 +100,9 @@ export default Plugin.define({
       }
     }
 
-    // --- wire cursor state ---
-    // deno-lint-ignore no-explicit-any
-    let fs: any = null
-    let cursor = 0
-    const initWire = () => {
-      if (fs) return true
-      try {
-        // deno-lint-ignore no-explicit-any
-        fs = (globalThis as any).process?.getBuiltinModule?.("node:fs")
-      } catch {}
-      if (!fs) return false
-      try {
-        cursor = fs.statSync(WIRE_LOG).size
-      } catch {
-        cursor = 0
-      }
-      return true
-    }
-    initWire()
-
-    /**
-     * Find the first unconsumed wire Cyrillic sequence (ESC + 2-byte UTF-8
-     * with a d0/d1 lead — a signature mouse CSI and alt+ASCII never have)
-     * and consume the wire up to and including it. Junk between the cursor
-     * and it (mouse wheel floods, plain typing, real alt+ASCII presses)
-     * is skipped, because those do not reach this handler: mouse events are
-     * eaten by processSingleMouseEvent, and alt+ASCII parses natively.
-     * FIFO order matches press order, so batched presses stay aligned.
-     */
-    const consumeCyr = (): string | "none" | "unavail" => {
-      if (!initWire()) return "unavail"
-      let buf: Buffer
-      try {
-        const size = fs.statSync(WIRE_LOG).size
-        // Bound staleness: never rewind more than 8 KiB behind the writer.
-        const start = Math.min(cursor, Math.max(0, size - 8192))
-        if (start > cursor) cursor = start
-        buf = fs.readFileSync(WIRE_LOG).subarray(cursor, Math.min(size, cursor + 8192))
-      } catch {
-        return "unavail"
-      }
-      const base = cursor
-      let i = 0
-      while (i < buf.length) {
-        let p = i
-        while (p < buf.length && buf[p] !== 0x1b) p++
-        if (p >= buf.length) {
-          cursor = base + buf.length
-          return "none"
-        }
-        const b1 = buf[p + 1]
-        if (b1 === undefined) {
-          // Lone ESC at the tail (Escape key press): leave it for the next
-          // press to pair with.
-          cursor = base + p
-          return "none"
-        }
-        if (b1 === 0xd0 || b1 === 0xd1) {
-          const b2 = buf[p + 2]
-          if (b2 === undefined) {
-            // Partial UTF-8 at the tail: wait for the continuation.
-            cursor = base + p
-            return "none"
-          }
-          if ((b2 & 0xc0) === 0x80) {
-            const cp = ((b1 & 0x1f) << 6) | (b2 & 0x3f)
-            const ch = String.fromCodePoint(cp)
-            cursor = base + p + 3
-            if (MAP[ch] !== undefined) return ch
-            i = p + 3
-            continue
-          }
-        }
-        // Non-Cyrillic ESC sequence: CSI or ESC+byte. CSI final byte is
-        // 0x40-0x7E; everything else is a two-byte ESC+byte. An ESC+ESC
-        // pair is two sequence starts (Escape key + next press), so a lone
-        // ESC consumes exactly one byte.
-        if (b1 === 0x1b) {
-          i = p + 1
-          continue
-        }
-        let end = p + 2
-        if (b1 === 0x5b) {
-          let j = p + 2
-          while (j < buf.length && !(buf[j] >= 0x40 && buf[j] <= 0x7e)) j++
-          if (j >= buf.length) {
-            // Incomplete CSI at the tail: leave it unconsumed.
-            cursor = base + p
-            return "none"
-          }
-          end = j + 1
-        }
-        i = end
-      }
-      cursor = base + buf.length
-      return "none"
-    }
-
-    // Safety net when the wire is unreadable: stash the truncated alt+ASCII
-    // event and replay it if no confirmation arrives.
+    // Fallback for legacy terminals: the parser splits ESC+UTF-8 Cyrillic
+    // into ESC+(cp & 0xFF) and ESC+U+FFFD. Stash the truncated first event
+    // and replay it if no confirmation arrives.
     let stash: { seq: string; timer: ReturnType<typeof setTimeout> } | null = null
     const dropStash = () => {
       if (!stash) return
@@ -228,42 +119,26 @@ export default Plugin.define({
 
       if (sequence.charCodeAt(0) !== 27) return false
 
-      // Partner events (ESC+U+FFFD) belong to a press already handled via
-      // the wire; they carry no new bytes -> swallow silently.
+      // Partner event (ESC+U+FFFD) carries no new bytes -> swallow silently.
       if (sequence === "\x1b\ufffd") return false
 
-      // Lone ESC (Escape key): consume nothing — its wire byte is absorbed
-      // as junk by the next skip (e.g. ESC+ESC before a press).
+      // Lone ESC (Escape key).
       if (sequence.length === 1) return false
 
-      // ESC+byte or exotic ESC event: match it against the next unconsumed
-      // wire Cyrillic sequence (FIFO). Real alt+ASCII and mouse ESC events
-      // see no Cyrillic pending and flow through natively.
-      const r = consumeCyr()
-      if (r === "unavail") {
-        // Wire unavailable: fall back to the stash/timeout heuristic on
-        // the truncated first event.
-        dropStash()
-        const timer = setTimeout(() => {
-          if (stash?.timer === timer) {
-            stash = null
-            replay(sequence)
-          }
-        }, 60)
-        stash = { seq: sequence, timer }
-        return true
-      }
-      if (r === "none") return false
-      return replay(`\x1b${MAP[r]!}`)
+      // ESC+byte: a legacy terminal split an alt+Cyrillic press. Stash the
+      // truncated event and replay it if no confirmation arrives.
+      dropStash()
+      const timer = setTimeout(() => {
+        if (stash?.timer === timer) {
+          stash = null
+          replay(sequence)
+        }
+      }, 60)
+      stash = { seq: sequence, timer }
+      return true
     }
 
     renderer.prependInputHandler(handler)
-
-    // Keep the renderer dumping raw stdin chunks to the wire log (checked
-    // per chunk at runtime, so assigning it here is enough).
-    try {
-      renderer.stdinLogPath = WIRE_LOG
-    } catch {}
 
     return () => {
       dropStash()
